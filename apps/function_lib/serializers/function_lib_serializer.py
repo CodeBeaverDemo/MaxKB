@@ -13,7 +13,7 @@ import uuid
 
 from django.core import validators
 from django.db import transaction
-from django.db.models import QuerySet, Q
+from django.db.models import QuerySet, Q, OuterRef, Exists
 from django.http import HttpResponse
 from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers, status
@@ -24,8 +24,9 @@ from common.field.common import UploadedFileField, UploadedImageField
 from common.response import result
 from common.util.field_message import ErrMessage
 from common.util.function_code import FunctionExecutor
-from dataset.models import Image
-from function_lib.models.function import FunctionLib
+from common.util.rsa_util import rsa_long_encrypt, rsa_long_decrypt
+from dataset.models import File
+from function_lib.models.function import FunctionLib, PermissionType, FunctionType
 from smartdoc.const import CONFIG
 
 function_executor = FunctionExecutor(CONFIG.get('SANDBOX'))
@@ -39,7 +40,7 @@ class FlibInstance:
 class FunctionLibModelSerializer(serializers.ModelSerializer):
     class Meta:
         model = FunctionLib
-        fields = ['id', 'name', 'icon', 'desc', 'code', 'input_field_list','init_field_list', 'permission_type', 'is_active', 'user_id',
+        fields = ['id', 'name', 'icon', 'desc', 'code', 'input_field_list','init_field_list', 'permission_type', 'is_active', 'user_id', 'template_id',
                   'create_time', 'update_time']
 
 
@@ -116,6 +117,7 @@ class FunctionLibSerializer(serializers.Serializer):
 
         user_id = serializers.UUIDField(required=True, error_messages=ErrMessage.uuid(_('user id')))
         select_user_id = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+        function_type = serializers.CharField(required=False, allow_null=True, allow_blank=True)
 
         def get_query_set(self):
             query_set = QuerySet(FunctionLib).filter(
@@ -128,19 +130,46 @@ class FunctionLibSerializer(serializers.Serializer):
                 query_set = query_set.filter(is_active=self.data.get('is_active'))
             if self.data.get('select_user_id') is not None:
                 query_set = query_set.filter(user_id=self.data.get('select_user_id'))
+            if self.data.get('function_type') is not None:
+                query_set = query_set.filter(function_type=self.data.get('function_type'))
             query_set = query_set.order_by("-create_time")
+
+            subquery = FunctionLib.objects.filter(template_id=OuterRef('id'))
+            subquery = subquery.filter(user_id=self.data.get('user_id'))
+            query_set = query_set.annotate(added=Exists(subquery))
+
             return query_set
 
         def list(self, with_valid=True):
             if with_valid:
                 self.is_valid(raise_exception=True)
-            return [FunctionLibModelSerializer(item).data for item in self.get_query_set()]
+            rs = []
+            for item in self.get_query_set():
+                if item.init_field_list:
+                    init_field_list = json.loads(rsa_long_decrypt(item.init_field_list))
+                else:
+                    init_field_list = []
+                data = {**FunctionLibModelSerializer(item).data, 'init_field_list': init_field_list}
+                rs.append(data)
+            return rs
 
         def page(self, current_page: int, page_size: int, with_valid=True):
             if with_valid:
                 self.is_valid(raise_exception=True)
+
+            def post_records_handler(row):
+                if row.init_field_list:
+                    init_field_list = json.loads(rsa_long_decrypt(row.init_field_list))
+                else:
+                    init_field_list = []
+                return {
+                    **FunctionLibModelSerializer(row).data,
+                    'added': row.added,
+                    'init_field_list': init_field_list
+                }
+
             return page_search(current_page, page_size, self.get_query_set(),
-                               post_records_handler=lambda row: FunctionLibModelSerializer(row).data)
+                               post_records_handler=post_records_handler)
 
     class Create(serializers.Serializer):
         user_id = serializers.UUIDField(required=True, error_messages=ErrMessage.uuid(_('user id')))
@@ -153,7 +182,7 @@ class FunctionLibSerializer(serializers.Serializer):
                                        code=instance.get('code'),
                                        user_id=self.data.get('user_id'),
                                        input_field_list=instance.get('input_field_list'),
-                                       init_field_list=instance.get('init_field_list'),
+                                       init_field_list=rsa_long_encrypt(json.dumps(instance.get('init_field_list'))),
                                        permission_type=instance.get('permission_type'),
                                        is_active=instance.get('is_active', True))
             function_lib.save()
@@ -227,6 +256,9 @@ class FunctionLibSerializer(serializers.Serializer):
         def delete(self, with_valid=True):
             if with_valid:
                 self.is_valid(raise_exception=True)
+            fun = QuerySet(FunctionLib).filter(id=self.data.get('id')).first()
+            if fun.template_id is None and fun.icon != '/ui/favicon.ico':
+                QuerySet(File).filter(id=fun.icon.split('/')[-1]).delete()
             QuerySet(FunctionLib).filter(id=self.data.get('id')).delete()
             return True
 
@@ -234,9 +266,10 @@ class FunctionLibSerializer(serializers.Serializer):
             if with_valid:
                 self.is_valid(raise_exception=True)
                 EditFunctionLib(data=instance).is_valid(raise_exception=True)
-            edit_field_list = ['name', 'desc', 'code', 'input_field_list', 'init_field_list', 'permission_type', 'is_active']
+            edit_field_list = ['name', 'desc', 'code', 'icon', 'input_field_list', 'init_field_list', 'permission_type', 'is_active']
             edit_dict = {field: instance.get(field) for field in edit_field_list if (
                     field in instance and instance.get(field) is not None)}
+            edit_dict['init_field_list'] = rsa_long_encrypt(json.dumps(instance.get('init_field_list')))
             QuerySet(FunctionLib).filter(id=self.data.get('id')).update(**edit_dict)
             return self.one(False)
 
@@ -247,6 +280,7 @@ class FunctionLibSerializer(serializers.Serializer):
                         Q(user_id=self.data.get('user_id')) | Q(permission_type='PUBLIC')).exists():
                     raise AppApiException(500, _('Function does not exist'))
             function_lib = QuerySet(FunctionLib).filter(id=self.data.get('id')).first()
+            function_lib.init_field_list = json.loads(rsa_long_decrypt(function_lib.init_field_list))
             return FunctionLibModelSerializer(function_lib).data
 
         def export(self, with_valid=True):
@@ -300,10 +334,54 @@ class FunctionLibSerializer(serializers.Serializer):
             functionLib = QuerySet(FunctionLib).filter(id=self.data.get('id')).first()
             if functionLib is None:
                 raise AppApiException(500, _('Function does not exist'))
-            image_id = uuid.uuid1()
-            image = Image(id=image_id, image=self.data.get('image').read(), image_name=self.data.get('image').name)
-            image.save()
-            functionLib.icon = f'/api/image/{image_id}'
+            # 删除旧的图片
+            if functionLib.icon != '/ui/favicon.ico':
+                QuerySet(File).filter(id=functionLib.icon.split('/')[-1]).delete()
+            if self.data.get('image') is None:
+                functionLib.icon = '/ui/favicon.ico'
+            else:
+                meta = {
+                    'debug': False
+                }
+                file_id = uuid.uuid1()
+                file = File(id=file_id, file_name=self.data.get('image').name, meta=meta)
+                file.save(self.data.get('image').read())
+
+                functionLib.icon = f'/api/file/{file_id}'
             functionLib.save()
 
             return functionLib.icon
+
+    class InternalFunction(serializers.Serializer):
+        id = serializers.UUIDField(required=True, error_messages=ErrMessage.uuid(_("function ID")))
+        user_id = serializers.UUIDField(required=True, error_messages=ErrMessage.uuid(_("User ID")))
+
+        def add(self, with_valid=True):
+            if with_valid:
+                self.is_valid(raise_exception=True)
+
+            if QuerySet(FunctionLib).filter(template_id=self.data.get('id')).filter(
+                    user_id=self.data.get('user_id')).exists():
+                raise AppApiException(500, _('Function already exists'))
+
+            internal_function_lib = QuerySet(FunctionLib).filter(id=self.data.get('id')).first()
+            if internal_function_lib is None:
+                raise AppApiException(500, _('Function does not exist'))
+
+            function_lib = FunctionLib(
+                id=uuid.uuid1(),
+                name=internal_function_lib.name,
+                desc=internal_function_lib.desc,
+                code=internal_function_lib.code,
+                user_id=self.data.get('user_id'),
+                input_field_list=internal_function_lib.input_field_list,
+                init_field_list=internal_function_lib.init_field_list,
+                permission_type=PermissionType.PRIVATE,
+                template_id=internal_function_lib.id,
+                function_type=FunctionType.PUBLIC,
+                icon=internal_function_lib.icon,
+                is_active=False
+            )
+            function_lib.save()
+
+            return FunctionLibModelSerializer(function_lib).data

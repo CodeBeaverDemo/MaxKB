@@ -114,6 +114,7 @@ import type { FormInstance } from 'element-plus'
 import DynamicsForm from '@/components/dynamics-form/index.vue'
 
 const FormRef = ref()
+const dynamicsFormRef = ref()
 const loading = ref(false)
 const debugVisible = ref(false)
 const showResult = ref(false)
@@ -143,8 +144,11 @@ watch(debugVisible, (bool) => {
 })
 
 const submit = async (formEl: FormInstance | undefined) => {
+  form.value.init_field_list.forEach((item: any) => {
+    item.value = init_form_data.value[item.field]
+  })
   const validate = formEl ? formEl.validate() : Promise.resolve()
-  validate.then(() => {
+  Promise.all([dynamicsFormRef.value?.validate(), validate]).then(() => {
     functionLibApi.postFunctionLibDebug(form.value, loading).then((res) => {
       if (res.code === 500) {
         showResult.value = true
